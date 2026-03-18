@@ -49,7 +49,7 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
     Effect.gen(function* () {
       const instance = yield* InstanceContext
 
-      const enabled: Record<string, boolean> = {}
+      const commands: Record<string, string[] | false> = {}
       const formatters: Record<string, Formatter.Info> = {}
 
       const cfg = yield* Effect.promise(() => Config.get())
@@ -64,14 +64,11 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
             continue
           }
           const result = mergeDeep(formatters[name] ?? {}, {
-            command: [],
             extensions: [],
             ...item,
           }) as Formatter.Info
 
-          if (result.command.length === 0) continue
-
-          result.enabled = async () => true
+          result.enabled = async () => item.command ?? false
           result.name = name
           formatters[name] = result
         }
@@ -79,23 +76,24 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
         log.info("all formatters are disabled")
       }
 
-      async function isEnabled(item: Formatter.Info) {
-        let status = enabled[item.name]
-        if (status === undefined) {
-          status = await item.enabled()
-          enabled[item.name] = status
+      async function resolve(item: Formatter.Info) {
+        let cmd = commands[item.name]
+        if (cmd === undefined) {
+          cmd = await item.enabled()
+          commands[item.name] = cmd
         }
-        return status
+        return cmd
       }
 
       async function getFormatter(ext: string) {
-        const result = []
+        const result: { info: Formatter.Info; cmd: string[] }[] = []
         for (const item of Object.values(formatters)) {
           log.info("checking", { name: item.name, ext })
           if (!item.extensions.includes(ext)) continue
-          if (!(await isEnabled(item))) continue
+          const cmd = await resolve(item)
+          if (!cmd) continue
           log.info("enabled", { name: item.name, ext })
-          result.push(item)
+          result.push({ info: item, cmd })
         }
         return result
       }
@@ -108,13 +106,13 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
           const ext = path.extname(file)
 
           for (const item of await getFormatter(ext)) {
-            log.info("running", { command: item.command })
+            log.info("running", { command: item.cmd })
             try {
               const proc = Process.spawn(
-                item.command.map((x) => x.replace("$FILE", file)),
+                item.cmd.map((x) => x.replace("$FILE", file)),
                 {
                   cwd: instance.directory,
-                  env: { ...process.env, ...item.environment },
+                  env: { ...process.env, ...item.info.environment },
                   stdout: "ignore",
                   stderr: "ignore",
                 },
@@ -122,14 +120,14 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
               const exit = await proc.exited
               if (exit !== 0)
                 log.error("failed", {
-                  command: item.command,
-                  ...item.environment,
+                  command: item.cmd,
+                  ...item.info.environment,
                 })
             } catch (error) {
               log.error("failed to format file", {
                 error,
-                command: item.command,
-                ...item.environment,
+                command: item.cmd,
+                ...item.info.environment,
                 file,
               })
             }
@@ -145,11 +143,11 @@ export class FormatService extends ServiceMap.Service<FormatService, FormatServi
       const status = Effect.fn("FormatService.status")(function* () {
         const result: Format.Status[] = []
         for (const formatter of Object.values(formatters)) {
-          const isOn = yield* Effect.promise(() => isEnabled(formatter))
+          const cmd = yield* Effect.promise(() => resolve(formatter))
           result.push({
             name: formatter.name,
             extensions: formatter.extensions,
-            enabled: isOn,
+            enabled: !!cmd,
           })
         }
         return result
